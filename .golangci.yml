@@ -1,0 +1,48 @@
+run:
+  timeout: 3m
+  allow-parallel-runners: true
+
+linters:
+  disable-all: true
+  enable:
+    - bodyclose
+    - cyclop
+    - decorder
+    - dupl
+    - errcheck
+    - errname
+    - errorlint
+    - exhaustive
+    - exportloopref
+    - forcetypeassert
+    - gocritic
+    - gocyclo
+    - godot
+    - gofumpt
+    - goimports
+    - gosec
+    - gosimple
+    - govet
+    - ineffassign
+    - misspell
+    - nestif
+    - nilerr
+    - nonamedreturns
+    - prealloc
+    - revive
+    - staticcheck
+    - tagliatelle
+    - unconvert
+    - unparam
+    - unused
+    - wastedassign
+
+issues:
+  exclude-use-default: false
+
+linters-settings:
+  revive:
+    rules:
+      - name: package-comments
+        severity: warning
+        disabled: true
