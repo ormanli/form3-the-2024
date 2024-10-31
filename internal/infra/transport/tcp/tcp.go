@@ -87,13 +87,18 @@ func (t *Transport) handleConnection(conn net.Conn) {
 	for scanner.Scan() {
 		request := scanner.Text()
 
+		responseChan := make(chan response, 1)
+
+		go func() {
+			responseChan <- t.handleRequest(request)
+		}()
+
 		select {
 		case <-t.stopHandlingChan:
 			fmt.Fprintf(conn, "%s\n", defaultCancelledResponse)
 
 			return
-		default:
-			response := t.handleRequest(request)
+		case response := <-responseChan:
 			fmt.Fprintf(conn, "%s\n", response)
 			slog.Debug("Handling request", "request", request, "response", response) // TODO update to make traceable
 		}
