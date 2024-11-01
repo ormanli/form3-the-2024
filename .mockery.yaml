@@ -1,0 +1,14 @@
+with-expecter: true
+disable-version-string: true
+filename: "mock_{{.InterfaceNameLower}}_test.go"
+packages:
+  github.com/ormanli/form3-te/internal/app/simulator:
+    config:
+      dir: "internal/app/simulator"
+    interfaces:
+      Service:
+  github.com/ormanli/form3-te/internal/infra/transport/tcp:
+    config:
+      dir: "internal/infra/transport/tcp"
+    interfaces:
+      Service:

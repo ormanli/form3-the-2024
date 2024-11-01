@@ -3,10 +3,14 @@ package tcp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/benbjohnson/clock"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ormanli/form3-te/internal/app/simulator"
@@ -16,8 +20,7 @@ func Test_Behaviour(t *testing.T) {
 	tests := []struct {
 		name               string
 		prepareMockService func(*MockService)
-		cfg                simulator.Config
-		flow               func(*testing.T, net.Conn)
+		run                func(*testing.T, net.Conn)
 	}{
 		{
 			name: "Valid input",
@@ -26,11 +29,7 @@ func Test_Behaviour(t *testing.T) {
 					Process(1).
 					Return(nil)
 			},
-			cfg: simulator.Config{
-				ServerHost:                    "localhost",
-				ServerGracefulShutdownTimeout: time.Second,
-			},
-			flow: func(t *testing.T, conn net.Conn) {
+			run: func(t *testing.T, conn net.Conn) {
 				_, err := conn.Write([]byte("PAYMENT|1\n"))
 				require.NoError(t, err)
 
@@ -44,11 +43,7 @@ func Test_Behaviour(t *testing.T) {
 		{
 			name:               "Invalid amount",
 			prepareMockService: func(mockService *MockService) {},
-			cfg: simulator.Config{
-				ServerHost:                    "localhost",
-				ServerGracefulShutdownTimeout: time.Second,
-			},
-			flow: func(t *testing.T, conn net.Conn) {
+			run: func(t *testing.T, conn net.Conn) {
 				_, err := conn.Write([]byte("PAYMENT|A\n"))
 				require.NoError(t, err)
 
@@ -62,11 +57,7 @@ func Test_Behaviour(t *testing.T) {
 		{
 			name:               "Invalid request",
 			prepareMockService: func(mockService *MockService) {},
-			cfg: simulator.Config{
-				ServerHost:                    "localhost",
-				ServerGracefulShutdownTimeout: time.Second,
-			},
-			flow: func(t *testing.T, conn net.Conn) {
+			run: func(t *testing.T, conn net.Conn) {
 				_, err := conn.Write([]byte("CHECKOUT|1\n"))
 				require.NoError(t, err)
 
@@ -84,11 +75,7 @@ func Test_Behaviour(t *testing.T) {
 					Process(1).
 					Return(errors.New("service failure"))
 			},
-			cfg: simulator.Config{
-				ServerHost:                    "localhost",
-				ServerGracefulShutdownTimeout: time.Second,
-			},
-			flow: func(t *testing.T, conn net.Conn) {
+			run: func(t *testing.T, conn net.Conn) {
 				_, err := conn.Write([]byte("PAYMENT|1\n"))
 				require.NoError(t, err)
 
@@ -107,138 +94,175 @@ func Test_Behaviour(t *testing.T) {
 
 			ctx, cncl := context.WithCancel(context.Background())
 
-			transport := NewTransport(test.cfg, mockService)
-			go transport.Stop(ctx)
+			port, err := getFreePort()
+			require.NoError(t, err)
+
+			cfg := simulator.Config{
+				ServerPort: port,
+				ServerHost: "localhost",
+			}
+
+			transport := NewTransport(cfg, mockService, clock.New())
 			go transport.Start(ctx)
 
 			defer cncl()
 
-			require.Eventually(t, func() bool {
-				return transport.listener != nil
-			}, time.Second, time.Millisecond)
-
-			conn, err := net.Dial(transport.listener.Addr().Network(), transport.listener.Addr().String())
+			conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
 			require.NoError(t, err)
 			defer conn.Close()
 
-			test.flow(t, conn)
+			test.run(t, conn)
 		})
 	}
 }
 
-func Test_GracefulShutdown_DontAcceptNewConnection(t *testing.T) {
-	mockService := NewMockService(t)
+func Test_GracefulShutdown(t *testing.T) {
+	tests := []struct {
+		name               string
+		prepareMockService func(*MockService)
+		run                func(*testing.T, int, *contextAndCancel, *clock.Mock)
+	}{
+		{
+			name:               "Don't Accept New Connection During Grace Period",
+			prepareMockService: func(*MockService) {},
+			run: func(t *testing.T, port int, contextAndCancel *contextAndCancel, mockClock *clock.Mock) {
+				contextAndCancel.cncl()
 
-	cfg := simulator.Config{
-		ServerHost:                    "localhost",
-		ServerGracefulShutdownTimeout: time.Second,
+				mockClock.Add(time.Second)
+
+				conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+				assert.ErrorContains(t, err, "connect: connection refused")
+				assert.Nil(t, conn)
+			},
+		},
+		{
+			name: "Accept Request From Existing Connection During Grace Period",
+			prepareMockService: func(mockService *MockService) {
+				mockService.EXPECT().
+					Process(1).
+					Return(nil)
+
+				mockService.EXPECT().
+					Process(2).
+					Return(nil)
+			},
+			run: func(t *testing.T, port int, contextAndCancel *contextAndCancel, mockClock *clock.Mock) {
+				conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port)) // TODO add second connection
+				require.NoError(t, err)
+				defer conn.Close()
+
+				_, err = conn.Write([]byte("PAYMENT|1\n"))
+				require.NoError(t, err)
+
+				firstResponse := make([]byte, 1024)
+				_, err = conn.Read(firstResponse)
+				require.NoError(t, err)
+				require.Contains(t, string(firstResponse), "RESPONSE|ACCEPTED|Transaction processed")
+
+				contextAndCancel.cncl()
+
+				mockClock.Add(time.Second)
+
+				_, err = conn.Write([]byte("PAYMENT|2\n"))
+				require.NoError(t, err)
+
+				secondResponse := make([]byte, 1024)
+				_, err = conn.Read(secondResponse)
+				require.NoError(t, err)
+				require.Contains(t, string(secondResponse), "RESPONSE|ACCEPTED|Transaction processed")
+			},
+		},
+		{
+			name: "Request Not Processed During Grace Period",
+			prepareMockService: func(mockService *MockService) {
+				mockService.EXPECT().
+					Process(1).
+					After(100 * time.Second).
+					Return(nil)
+			},
+			run: func(t *testing.T, port int, contextAndCancel *contextAndCancel, mockClock *clock.Mock) {
+				conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+				require.NoError(t, err)
+				defer conn.Close()
+
+				_, err = conn.Write([]byte("PAYMENT|1\n"))
+				require.NoError(t, err)
+
+				contextAndCancel.cncl()
+
+				for i := 0; i < 10; i++ {
+					mockClock.Add(time.Second)
+				}
+
+				response := make([]byte, 1024)
+				_, err = conn.Read(response)
+				require.NoError(t, err)
+				require.Contains(t, string(response), "RESPONSE|REJECTED|Cancelled")
+			},
+		},
 	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mockService := NewMockService(t)
+			test.prepareMockService(mockService)
 
-	ctx, cncl := context.WithCancel(context.Background())
+			startCtx, startCncl := context.WithCancel(context.Background())
 
-	transport := NewTransport(cfg, mockService)
-	go transport.Stop(ctx)
-	go transport.Start(ctx)
+			port, err := getFreePort()
+			require.NoError(t, err)
 
-	require.Eventually(t, func() bool {
-		return transport.listener != nil
-	}, time.Second, time.Millisecond)
+			cfg := simulator.Config{
+				ServerPort:                    port,
+				ServerHost:                    "localhost",
+				ServerGracefulShutdownTimeout: time.Second,
+			}
 
-	cncl()
+			mockClock := clock.NewMock()
 
-	conn, err := net.Dial(transport.listener.Addr().Network(), transport.listener.Addr().String())
-	require.ErrorContains(t, err, "connect: connection refused")
-	require.Nil(t, conn)
+			transport := NewTransport(cfg, mockService, mockClock)
+			go transport.Start(startCtx)
+
+			test.run(t, port, &contextAndCancel{
+				ctx:  startCtx,
+				cncl: startCncl,
+			}, mockClock)
+		})
+	}
 }
 
-func Test_GracefulShutdown_AcceptRequestFromExistingConnection(t *testing.T) {
-	mockService := NewMockService(t)
-	mockService.EXPECT().
-		Process(1).
-		Return(nil)
+var (
+	freePortMu     sync.Mutex
+	allocatedPorts = make(map[int]struct{})
+)
 
-	mockService.EXPECT().
-		Process(2).
-		Return(nil)
+// getFreePort returns a free port number.
+func getFreePort() (int, error) {
+	freePortMu.Lock()
+	defer freePortMu.Unlock()
 
-	cfg := simulator.Config{
-		ServerHost:                    "localhost",
-		ServerGracefulShutdownTimeout: time.Second,
+	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
+	if err != nil {
+		return 0, err
 	}
 
-	startCtx, startCncl := context.WithCancel(context.Background())
-	stopCtx, stopCncl := context.WithCancel(context.Background())
+	l, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	defer l.Close()
 
-	transport := NewTransport(cfg, mockService)
-	go transport.Stop(stopCtx)
-	go transport.Start(startCtx)
+	port := l.Addr().(*net.TCPAddr).Port //nolint:forcetypeassert
 
-	require.Eventually(t, func() bool {
-		return transport.listener != nil
-	}, time.Second, time.Millisecond)
+	if _, exists := allocatedPorts[port]; exists {
+		return getFreePort()
+	}
 
-	conn, err := net.Dial(transport.listener.Addr().Network(), transport.listener.Addr().String())
-	require.NoError(t, err)
-	defer conn.Close()
+	allocatedPorts[port] = struct{}{}
 
-	_, err = conn.Write([]byte("PAYMENT|1\n"))
-	require.NoError(t, err)
-
-	out := make([]byte, 1024)
-
-	_, err = conn.Read(out)
-	require.NoError(t, err)
-	require.Contains(t, string(out), "RESPONSE|ACCEPTED|Transaction processed")
-
-	startCncl()
-
-	_, err = conn.Write([]byte("PAYMENT|2\n"))
-	require.NoError(t, err)
-
-	_, err = conn.Read(out) // todo new slice
-	require.NoError(t, err)
-	require.Contains(t, string(out), "RESPONSE|ACCEPTED|Transaction processed")
-
-	stopCncl()
+	return port, nil
 }
 
-func Test_GracefulShutdown_RequestNotProcessed(t *testing.T) {
-	mockService := NewMockService(t)
-	mockService.EXPECT().
-		Process(1).
-		After(time.Second).
-		Return(nil)
-
-	cfg := simulator.Config{
-		ServerHost:                    "localhost",
-		ServerGracefulShutdownTimeout: time.Second,
-	}
-
-	ctx, cncl := context.WithCancel(context.Background())
-	stopCtx, stopCncl := context.WithCancel(context.Background())
-
-	transport := NewTransport(cfg, mockService)
-	go transport.Stop(stopCtx)
-	go transport.Start(ctx)
-
-	require.Eventually(t, func() bool {
-		return transport.listener != nil
-	}, time.Second, time.Millisecond)
-
-	conn, err := net.Dial(transport.listener.Addr().Network(), transport.listener.Addr().String())
-	require.NoError(t, err)
-	defer conn.Close()
-
-	_, err = conn.Write([]byte("PAYMENT|1\n"))
-	require.NoError(t, err)
-
-	cncl()
-
-	stopCncl()
-
-	out := make([]byte, 1024)
-
-	_, err = conn.Read(out)
-	require.NoError(t, err)
-	require.Contains(t, string(out), "RESPONSE|REJECTED|Cancelled")
+type contextAndCancel struct {
+	ctx  context.Context
+	cncl context.CancelFunc
 }
