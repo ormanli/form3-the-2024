@@ -14,10 +14,12 @@ import (
 	"github.com/ormanli/form3-te/internal/app/simulator"
 )
 
+// Service defines the interface for processing requests.
 type Service interface {
 	Process(amount int) error
 }
 
+// Transport manages TCP connections and handles incoming requests.
 type Transport struct {
 	service          Service
 	cfg              simulator.Config
@@ -27,6 +29,7 @@ type Transport struct {
 	clock            clock.Clock
 }
 
+// NewTransport creates a new Transport instance.
 func NewTransport(cfg simulator.Config, service Service, clock clock.Clock) *Transport {
 	return &Transport{
 		cfg:              cfg,
@@ -37,6 +40,8 @@ func NewTransport(cfg simulator.Config, service Service, clock clock.Clock) *Tra
 	}
 }
 
+// Start initializes the TCP server and starts accepting connections.
+// It will block until context is cancelled and grace period is finished.
 func (t *Transport) Start(ctx context.Context) error {
 	var err error
 	t.listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", t.cfg.ServerHost, t.cfg.ServerPort))
@@ -52,39 +57,41 @@ func (t *Transport) Start(ctx context.Context) error {
 	go func() {
 		defer t.wg.Done()
 		for {
-			select {
-			case <-ctx.Done():
-				t.listener.Close()
-				return
-			default:
-				conn, err := t.listener.Accept()
-				if err != nil {
-					if errors.Is(err, net.ErrClosed) {
-						return
-					}
-					slog.Error("Failed to accept connection", "error", err)
-					continue
+			conn, err := t.listener.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
 				}
-
-				t.wg.Add(1)
-				go t.handleConnection(conn)
+				slog.Error("Failed to accept connection", "error", err)
+				continue
 			}
+
+			t.wg.Add(1)
+			go t.handleConnection(conn)
 		}
 	}()
 
 	t.waitForGracefulShutdown(ctx)
 
-	t.wg.Wait()
-
 	return nil
 }
 
+// waitForGracefulShutdown waits for a graceful shutdown signal, sleeps until shutdown timeout and then closes the channel to stop handling connections.
 func (t *Transport) waitForGracefulShutdown(ctx context.Context) {
 	<-ctx.Done()
+
+	slog.Info("Server graceful shutdown started")
+
+	err := t.listener.Close()
+	if err != nil {
+		slog.Error("Error closing listener", "error", err)
+	}
 
 	t.clock.Sleep(t.cfg.ServerGracefulShutdownTimeout)
 
 	close(t.stopHandlingChan)
+
+	t.wg.Wait()
 }
 
 var defaultCancelledResponse = response{
@@ -92,10 +99,11 @@ var defaultCancelledResponse = response{
 	reason: "Cancelled",
 }
 
+// handleConnection manages the lifecycle of a single TCP connection, reading requests and sending responses.
 func (t *Transport) handleConnection(conn net.Conn) {
 	defer t.wg.Done()
 
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck
 
 	slog.Debug("Handling connection", "remote", conn.RemoteAddr())
 
@@ -115,12 +123,10 @@ func (t *Transport) handleConnection(conn net.Conn) {
 
 		select {
 		case <-t.stopHandlingChan:
-			fmt.Fprintf(conn, "%s\n", defaultCancelledResponse)
-			slog.Debug("Handling request", "request", request, "response", defaultCancelledResponse)
+			writeResponse(conn, request, defaultCancelledResponse)
 			return
 		case response := <-responseChan:
-			fmt.Fprintf(conn, "%s\n", response)
-			slog.Debug("Handling request", "request", request, "response", response)
+			writeResponse(conn, request, response)
 		}
 	}
 
@@ -129,6 +135,7 @@ func (t *Transport) handleConnection(conn net.Conn) {
 	}
 }
 
+// handleRequest processes an incoming request and returns a corresponding response.
 func (t *Transport) handleRequest(s string) response {
 	r, err := parseRequest(s)
 	if err != nil {
@@ -150,4 +157,14 @@ func (t *Transport) handleRequest(s string) response {
 		status: Accepted,
 		reason: "Transaction processed",
 	}
+}
+
+// writeResponse sends a response back to the client over the provided connection.
+func writeResponse(conn net.Conn, request string, r response) {
+	_, err := fmt.Fprintf(conn, "%s\n", r)
+	if err != nil {
+		slog.Error("Failed to write response", "error", err, "request", request, "response", r)
+		return
+	}
+	slog.Debug("Handling request", "request", request, "response", r)
 }

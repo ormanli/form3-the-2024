@@ -14,7 +14,8 @@ import (
 func Run(ctx context.Context, cfg simulator.Config) error {
 	logging.Setup(cfg)
 
-	tcpTransport := tcp.NewTransport(cfg, simulator.NewValidationService(simulator.NewDummyService(cfg)), clock.New())
+	service := simulator.NewValidationService(simulator.NewDummyService(cfg))
+	tcpTransport := tcp.NewTransport(cfg, service, clock.New())
 
 	return tcpTransport.Start(ctx)
 }

@@ -6,6 +6,7 @@ linters:
   disable-all: true
   enable:
     - bodyclose
+    - copyloopvar
     - cyclop
     - decorder
     - dupl
@@ -13,7 +14,6 @@ linters:
     - errname
     - errorlint
     - exhaustive
-    - exportloopref
     - forcetypeassert
     - gocritic
     - gocyclo
@@ -30,6 +30,7 @@ linters:
     - nonamedreturns
     - prealloc
     - revive
+    - sloglint
     - staticcheck
     - tagliatelle
     - unconvert

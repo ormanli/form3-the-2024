@@ -10,3 +10,7 @@ generate-mocks:
 test:
 	go clean -testcache
 	go test ./... -race
+
+.PHONY: run
+run:
+	go run ./cmd/simulator/main.go
