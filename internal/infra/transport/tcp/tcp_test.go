@@ -150,7 +150,7 @@ func Test_GracefulShutdown(t *testing.T) {
 					Return(nil)
 			},
 			run: func(t *testing.T, port int, contextAndCancel *contextAndCancel, mockClock *clock.Mock) {
-				conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port)) // TODO add second connection
+				conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
 				require.NoError(t, err)
 				defer conn.Close() //nolint:errcheck
 
@@ -194,10 +194,8 @@ func Test_GracefulShutdown(t *testing.T) {
 				require.NoError(t, err)
 
 				contextAndCancel.cncl()
-
-				for i := 0; i < 10; i++ {
-					mockClock.Add(time.Second)
-				}
+				mockClock.Add(time.Second)
+				mockClock.Add(time.Second)
 
 				response := make([]byte, 1024)
 				_, err = conn.Read(response)
@@ -278,4 +276,96 @@ func getFreePort() (int, error) {
 type contextAndCancel struct {
 	ctx  context.Context
 	cncl context.CancelFunc
+}
+
+func Test_TwoSimultaneousConnections(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	startCtx, startCncl := context.WithCancel(context.Background())
+	defer startCncl()
+
+	mockService := NewMockService(t)
+
+	mockService.EXPECT().
+		Process(1).
+		Return(nil)
+
+	mockService.EXPECT().
+		Process(2).
+		Return(nil)
+
+	mockService.EXPECT().
+		Process(3).
+		Return(nil)
+
+	mockService.EXPECT().
+		Process(4).
+		Return(nil)
+
+	port, err := getFreePort()
+	require.NoError(t, err)
+
+	cfg := simulator.Config{
+		ServerPort: port,
+		ServerHost: "localhost",
+	}
+
+	mockClock := clock.NewMock()
+	transport := NewTransport(cfg, mockService, mockClock)
+	go transport.Start(startCtx) //nolint:errcheck
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+		require.NoError(t, err)
+		defer conn.Close() //nolint:errcheck
+
+		_, err = conn.Write([]byte("PAYMENT|1\n"))
+		require.NoError(t, err)
+
+		firstResponse := make([]byte, 1024)
+		_, err = conn.Read(firstResponse)
+		require.NoError(t, err)
+		require.Contains(t, string(firstResponse), "RESPONSE|ACCEPTED|Transaction processed")
+
+		_, err = conn.Write([]byte("PAYMENT|2\n"))
+		require.NoError(t, err)
+
+		secondResponse := make([]byte, 1024)
+		_, err = conn.Read(secondResponse)
+		require.NoError(t, err)
+		require.Contains(t, string(secondResponse), "RESPONSE|ACCEPTED|Transaction processed")
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		conn, err := net.Dial("tcp", fmt.Sprintf("localhost:%d", port))
+		require.NoError(t, err)
+		defer conn.Close() //nolint:errcheck
+
+		_, err = conn.Write([]byte("PAYMENT|3\n"))
+		require.NoError(t, err)
+
+		firstResponse := make([]byte, 1024)
+		_, err = conn.Read(firstResponse)
+		require.NoError(t, err)
+		require.Contains(t, string(firstResponse), "RESPONSE|ACCEPTED|Transaction processed")
+
+		_, err = conn.Write([]byte("PAYMENT|4\n"))
+		require.NoError(t, err)
+
+		secondResponse := make([]byte, 1024)
+		_, err = conn.Read(secondResponse)
+		require.NoError(t, err)
+		require.Contains(t, string(secondResponse), "RESPONSE|ACCEPTED|Transaction processed")
+	}()
+
+	wg.Wait()
+	mockClock.WaitForAllTimers()
 }

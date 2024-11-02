@@ -1,4 +1,4 @@
-# Form3 Technical Exercise
+# Form3 Take Home Exercise
 
 ## Requirements
 * Go >= 1.23
